@@ -1,420 +1,239 @@
+import warnings
+warnings.filterwarnings("ignore")
 
 import pandas as pd
 import numpy as np
-import warnings
-warnings.filterwarnings('ignore')
-
-from snowflake.snowpark import Session
-from snowflake.snowpark.functions import col
-
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.preprocessing import StandardScaler
+import os, re
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, roc_auc_score, classification_report,
-    confusion_matrix
-)
-from sklearn.model_selection import cross_val_score
-
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                              f1_score, roc_auc_score, confusion_matrix)
 import joblib
-import os
+import snowflake.connector
 
-CONNECTION_PARAMETERS = {
-    "account":   "YOUR_ACCOUNT_IDENTIFIER",  # e.g. "abc123.us-east-1"
-    "user":      "YOUR_USERNAME",
-    "password":  "YOUR_PASSWORD",
-    "role":      "SYSADMIN",                 # or ACCOUNTADMIN for trial
-    "warehouse": "PHISHING_ML_WH",
-    "database":  "PHISHING_DB",
-    "schema":    "PHISHING_SCHEMA"
-}
+ACCOUNT  = "QVFJDDX-OA60979"
+USER     = "HARSHA2501"
+PASSWORD = "Karukolahemanth@1234"
+BASE_DIR = r"C:\Users\DELL 7410\Downloads\kaggle_spam_data"
+MODEL_PATH = r"C:\Users\DELL 7410\OneDrive\Desktop\snowflake\data\best_model.pkl"
 
 print("=" * 60)
-print("  PHISHING EMAIL DETECTION - ML PIPELINE (SNOWPARK)")
+print("  Phishing / Spam Email Detector - ML Pipeline")
+print("  Source: Local Kaggle CSVs -> Results -> Snowflake")
 print("=" * 60)
 
-session = Session.builder.configs(CONNECTION_PARAMETERS).create()
-print(f"\n✅ Connected to Snowflake!")
-print(f"   Account  : {session.get_current_account()}")
-print(f"   User     : {session.get_current_user()}")
-print(f"   Warehouse: {session.get_current_warehouse()}")
-print(f"   Database : {session.get_current_database()}")
-print(f"   Schema   : {session.get_current_schema()}\n")
-
-print("─" * 60)
-print("📊 SECTION 2: LOADING DATA")
-print("─" * 60)
-
-snow_df = session.table("ENGINEERED_FEATURES")
-
-print(f"Total records in ENGINEERED_FEATURES: {snow_df.count()}")
-print("\nSchema:")
-snow_df.printSchema()
-
-df = snow_df.to_pandas()
-
-df.columns = df.columns.str.lower()
-
-print(f"\n✅ Data loaded into Pandas DataFrame: {df.shape}")
-print(f"\nFirst 5 rows:")
-print(df.head())
-
-print(f"\nClass distribution:")
-print(df['label'].value_counts())
-print(f"Phishing rate: {df['label'].mean()*100:.1f}%")
-
-print("\n" + "─" * 60)
-print("🔍 SECTION 3: EXPLORATORY DATA ANALYSIS")
-print("─" * 60)
-
-print("\n📈 Descriptive Statistics:")
-print(df.describe().round(3))
-
-print("\n📊 Feature Averages by Class:")
-feature_cols = [
-    'has_url', 'url_count', 'has_ip_url', 'url_length',
-    'has_urgent_words', 'html_tags_count', 'num_special_chars',
-    'word_count', 'subject_length', 'sender_name_mismatch',
-    'reply_to_different', 'spf_pass', 'dkim_pass',
-    'auth_both_failed', 'url_density', 'special_char_ratio',
-    'high_risk_combo', 'has_long_url', 'short_body'
+print("\nStep 1: Loading Kaggle datasets from local disk...")
+frames = []
+configs = [
+    ("Enron.csv",         ["subject", "body", "label"]),
+    ("CEAS_08.csv",       ["sender", "subject", "body", "label"]),
+    ("SpamAssasin.csv",   ["sender", "subject", "body", "label"]),
+    ("Nazario.csv",       ["sender", "subject", "body", "label"]),
+    ("Nigerian_Fraud.csv",["sender", "subject", "body", "label"]),
 ]
 
-comparison = df.groupby('label')[feature_cols].mean().round(3)
-comparison.index = ['Legitimate (0)', 'Phishing (1)']
-print(comparison.T.to_string())
+for fname, cols in configs:
+    fpath = os.path.join(BASE_DIR, fname)
+    try:
+        header = open(fpath, encoding="utf-8").readline()
+        available = [c for c in cols if c in header]
+        df = pd.read_csv(fpath, encoding="utf-8", on_bad_lines="skip", usecols=available)
+        df["source"] = fname.replace(".csv", "")
+        if "subject" not in df.columns: df["subject"] = ""
+        if "body"    not in df.columns: df["body"]    = ""
+        df["text"] = (df["subject"].fillna("") + " " + df["body"].fillna("")).str.strip()
+        df["label"] = pd.to_numeric(df["label"], errors="coerce").fillna(0).astype(int)
+        frames.append(df[["text", "label", "source"]])
+        lc = df["label"].value_counts().to_dict()
+        print(f"  {fname}: {len(df):,} rows | spam={lc.get(1,0):,} legit={lc.get(0,0):,}")
+    except Exception as e:
+        print(f"  {fname}: skipped ({e})")
 
-print(f"\n🔍 Missing Values:")
-missing = df.isnull().sum()
-if missing.sum() == 0:
-    print("  ✅ No missing values found!")
-else:
-    print(missing[missing > 0])
+combined = pd.concat(frames, ignore_index=True)
+combined = combined[combined["text"].str.len() > 5].reset_index(drop=True)
 
-print("\n📊 Feature Correlation with Label (Top 10):")
-correlations = df[feature_cols + ['label']].corr()['label'].drop('label')
-print(correlations.sort_values(ascending=False).head(10).round(4))
+total = len(combined)
+spam  = combined["label"].sum()
+legit = total - spam
+print(f"\n  Total loaded: {total:,} | Spam: {spam:,} | Legit: {legit:,}")
 
-print("\n" + "─" * 60)
-print("⚙️  SECTION 4: FEATURE ENGINEERING")
-print("─" * 60)
+print("\nStep 2: Cleaning text...")
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+", " url ", text)
+    text = re.sub(r"[^a-z\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
-FEATURES = [
-    'has_url', 'url_count', 'has_ip_url', 'url_length',
-    'has_urgent_words', 'html_tags_count', 'num_special_chars',
-    'word_count', 'subject_length', 'sender_name_mismatch',
-    'has_attachment', 'reply_to_different', 'spf_pass', 'dkim_pass',
-    'auth_both_failed', 'url_density', 'special_char_ratio',
-    'high_risk_combo', 'has_long_url', 'short_body'
-]
+combined["text"] = combined["text"].apply(clean_text)
 
-X = df[FEATURES]
-y = df['label']
-
-print(f"✅ Feature matrix shape : {X.shape}")
-print(f"✅ Target vector shape  : {y.shape}")
-print(f"✅ Features used ({len(FEATURES)}): {FEATURES}")
-
-print("\n" + "─" * 60)
-print("✂️  SECTION 5: TRAIN / TEST SPLIT")
-print("─" * 60)
-
-train_mask = df['email_id'].apply(lambda x: x % 5 != 0)
-test_mask  = df['email_id'].apply(lambda x: x % 5 == 0)
-
-X_train = X[train_mask]
-X_test  = X[test_mask]
-y_train = y[train_mask]
-y_test  = y[test_mask]
-
-print(f"Training set : {X_train.shape[0]} samples "
-      f"({y_train.sum()} phishing, {(y_train==0).sum()} legitimate)")
-print(f"Test set     : {X_test.shape[0]} samples "
-      f"({y_test.sum()} phishing, {(y_test==0).sum()} legitimate)")
-
-print("\n" + "─" * 60)
-print("🤖 SECTION 6: MODEL TRAINING")
-print("─" * 60)
-
-models = {
-    "Logistic Regression": Pipeline([
-        ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(random_state=42, max_iter=1000, C=1.0))
-    ]),
-    "Decision Tree": Pipeline([
-        ('clf', DecisionTreeClassifier(random_state=42, max_depth=6, min_samples_leaf=2))
-    ]),
-    "Random Forest": Pipeline([
-        ('clf', RandomForestClassifier(
-            n_estimators=100, random_state=42,
-            max_depth=8, min_samples_leaf=2, n_jobs=-1
-        ))
-    ]),
-    "Gradient Boosting": Pipeline([
-        ('clf', GradientBoostingClassifier(
-            n_estimators=100, random_state=42,
-            learning_rate=0.1, max_depth=5
-        ))
-    ])
-}
-
-results = {}
-
-for model_name, pipeline in models.items():
-    print(f"\n  Training: {model_name}...")
-
-    pipeline.fit(X_train, y_train)
-
-    y_pred       = pipeline.predict(X_test)
-    y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
-
-    acc       = accuracy_score(y_test, y_pred)
-    prec      = precision_score(y_test, y_pred, zero_division=0)
-    rec       = recall_score(y_test, y_pred, zero_division=0)
-    f1        = f1_score(y_test, y_pred, zero_division=0)
-    auc       = roc_auc_score(y_test, y_pred_proba)
-
-    cv_scores = cross_val_score(pipeline, X_train, y_train, cv=5, scoring='f1')
-
-    results[model_name] = {
-        'pipeline':    pipeline,
-        'y_pred':      y_pred,
-        'y_pred_proba': y_pred_proba,
-        'accuracy':    acc,
-        'precision':   prec,
-        'recall':      rec,
-        'f1':          f1,
-        'auc_roc':     auc,
-        'cv_f1_mean':  cv_scores.mean(),
-        'cv_f1_std':   cv_scores.std()
-    }
-
-    print(f"    Accuracy : {acc:.4f} ({acc*100:.2f}%)")
-    print(f"    Precision: {prec:.4f}")
-    print(f"    Recall   : {rec:.4f}")
-    print(f"    F1 Score : {f1:.4f}")
-    print(f"    AUC-ROC  : {auc:.4f}")
-    print(f"    CV F1    : {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
-
-print("\n" + "─" * 60)
-print("📊 SECTION 7: MODEL COMPARISON")
-print("─" * 60)
-
-print(f"\n{'Model':<25} {'Accuracy':>10} {'Precision':>10} "
-      f"{'Recall':>10} {'F1 Score':>10} {'AUC-ROC':>10}")
-print("─" * 80)
-
-for name, res in results.items():
-    print(f"{name:<25} {res['accuracy']:>10.4f} {res['precision']:>10.4f} "
-          f"{res['recall']:>10.4f} {res['f1']:>10.4f} {res['auc_roc']:>10.4f}")
-
-best_model_name = max(results, key=lambda k: results[k]['f1'])
-best_result     = results[best_model_name]
-best_pipeline   = best_result['pipeline']
-
-print(f"\n🏆 Best Model: {best_model_name}")
-print(f"   F1 Score : {best_result['f1']:.4f}")
-print(f"   AUC-ROC  : {best_result['auc_roc']:.4f}")
-
-print(f"\n📋 Classification Report ({best_model_name}):")
-print(classification_report(
-    y_test, best_result['y_pred'],
-    target_names=['Legitimate', 'Phishing']
-))
-
-cm = confusion_matrix(y_test, best_result['y_pred'])
-print(f"Confusion Matrix:")
-print(f"  TN={cm[0,0]} | FP={cm[0,1]}")
-print(f"  FN={cm[1,0]} | TP={cm[1,1]}")
-
-print("\n" + "─" * 60)
-print("🌟 SECTION 8: FEATURE IMPORTANCE")
-print("─" * 60)
-
-rf_model = results['Random Forest']['pipeline'].named_steps['clf']
-importances = pd.Series(rf_model.feature_importances_, index=FEATURES)
-importances_sorted = importances.sort_values(ascending=False)
-
-print("\nTop 10 Most Important Features (Random Forest):")
-for i, (feat, imp) in enumerate(importances_sorted.head(10).items(), 1):
-    bar = "█" * int(imp * 100)
-    print(f"  {i:2}. {feat:<25} {imp:.4f} {bar}")
-
-print("\n" + "─" * 60)
-print("💾 SECTION 9: SAVING MODEL TO SNOWFLAKE STAGE")
-print("─" * 60)
-
-model_filename = "phishing_detector_model.pkl"
-local_model_path = os.path.join(os.getcwd(), model_filename)
-
-joblib.dump(best_pipeline, local_model_path)
-print(f"✅ Model saved locally: {local_model_path}")
-
-session.sql("""
-    CREATE STAGE IF NOT EXISTS PHISHING_MODEL_STAGE
-    COMMENT = 'Stage to store trained ML model files'
-""").collect()
-
-session.file.put(
-    local_path=local_model_path,
-    stage_location="@PHISHING_MODEL_STAGE",
-    overwrite=True
+X = combined["text"]
+y = combined["label"]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
 )
-print(f"✅ Model uploaded to: @PHISHING_MODEL_STAGE/{model_filename}")
+print(f"  Train: {len(X_train):,}  |  Test: {len(X_test):,}")
 
-stage_files = session.sql("LIST @PHISHING_MODEL_STAGE").collect()
-print(f"\nFiles in @PHISHING_MODEL_STAGE:")
-for f in stage_files:
-    print(f"  → {f['name']}  ({f['size']} bytes)")
+TFIDF = TfidfVectorizer(
+    max_features  = 30_000,
+    ngram_range   = (1, 2),
+    sublinear_tf  = True,
+    min_df        = 2,
+    strip_accents = "unicode",
+    token_pattern = r"\b[a-zA-Z]\w+\b",
+)
 
-print("\n" + "─" * 60)
-print("📤 SECTION 10: WRITING RESULTS TO SNOWFLAKE")
-print("─" * 60)
+MODELS = {
+    "Logistic Regression": LogisticRegression(
+        C=1.0, max_iter=1000, solver="lbfgs",
+        class_weight="balanced", random_state=42,
+    ),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=100, max_depth=20,
+        class_weight="balanced", random_state=42, n_jobs=-1,
+    ),
+    "Decision Tree": DecisionTreeClassifier(
+        max_depth=15, class_weight="balanced", random_state=42,
+    ),
+    "Gradient Boosting": GradientBoostingClassifier(
+        n_estimators=100, max_depth=5, random_state=42,
+    ),
+}
 
-all_predictions = []
-for model_name, res in results.items():
-    test_ids = df[test_mask]['email_id'].values
-    for i, email_id in enumerate(test_ids):
-        all_predictions.append({
-            'EMAIL_ID':         int(email_id),
-            'ACTUAL_LABEL':     int(y_test.iloc[i]),
-            'PREDICTED_LABEL':  int(res['y_pred'][i]),
-            'PREDICTION_PROBA': float(res['y_pred_proba'][i]),
-            'IS_CORRECT':       bool(y_test.iloc[i] == res['y_pred'][i]),
-            'SPLIT_TYPE':       'TEST'
-        })
+print("\nStep 3: Training 4 models...")
+print("-" * 60)
+results = []
 
-pred_df = pd.DataFrame(all_predictions)
+for name, clf in MODELS.items():
+    print(f"\n  [{name}] Training...", end="", flush=True)
+    pipe = Pipeline([("tfidf", TFIDF), ("clf", clf)])
+    pipe.fit(X_train, y_train)
 
-session.sql("TRUNCATE TABLE IF EXISTS MODEL_PREDICTIONS").collect()
-snow_pred_df = session.create_dataframe(pred_df)
-snow_pred_df.write.mode("append").save_as_table("MODEL_PREDICTIONS")
-print(f"✅ Predictions written: {len(pred_df)} rows to MODEL_PREDICTIONS")
+    y_pred  = pipe.predict(X_test)
+    y_proba = pipe.predict_proba(X_test)[:, 1]
 
-metrics_rows = []
-for model_name, res in results.items():
-    metrics_rows.append({
-        'MODEL_NAME':      model_name,
-        'ACCURACY':        float(res['accuracy']),
-        'PRECISION_SCORE': float(res['precision']),
-        'RECALL_SCORE':    float(res['recall']),
-        'F1_SCORE':        float(res['f1']),
-        'AUC_ROC':         float(res['auc_roc']),
-        'TRAINED_AT':      pd.Timestamp.now()
+    acc  = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec  = recall_score(y_test, y_pred, zero_division=0)
+    f1   = f1_score(y_test, y_pred, zero_division=0)
+    auc  = roc_auc_score(y_test, y_proba)
+    cm   = confusion_matrix(y_test, y_pred)
+
+    print(f" done!")
+    print(f"    Accuracy : {acc*100:.2f}%")
+    print(f"    Precision: {prec*100:.2f}%")
+    print(f"    Recall   : {rec*100:.2f}%")
+    print(f"    F1 Score : {f1*100:.2f}%")
+    print(f"    AUC-ROC  : {auc:.4f}")
+
+    results.append({
+        "name": name, "pipeline": pipe,
+        "accuracy": acc, "precision": prec,
+        "recall": rec, "f1": f1, "auc_roc": auc, "cm": cm,
     })
 
-metrics_df = pd.DataFrame(metrics_rows)
-session.sql("TRUNCATE TABLE IF EXISTS MODEL_METRICS").collect()
-snow_metrics_df = session.create_dataframe(metrics_df)
-snow_metrics_df.write.mode("append").save_as_table("MODEL_METRICS")
-print(f"✅ Metrics written: {len(metrics_df)} models to MODEL_METRICS")
+best = max(results, key=lambda x: x["f1"])
+print(f"\n{'='*60}")
+print(f"  Best Model : {best['name']}")
+print(f"  F1 Score   : {best['f1']*100:.2f}%")
+print(f"  AUC-ROC    : {best['auc_roc']:.4f}")
+print(f"{'='*60}")
 
-print("\n📊 Model Metrics in Snowflake:")
-session.sql("""
-    SELECT MODEL_NAME,
-           ROUND(ACCURACY*100,2) AS ACCURACY_PCT,
-           ROUND(F1_SCORE*100,2) AS F1_PCT,
-           ROUND(AUC_ROC,4) AS AUC_ROC
-    FROM MODEL_METRICS
-    ORDER BY F1_SCORE DESC
-""").show()
+print(f"\nStep 4: Saving best model...")
+joblib.dump(best["pipeline"], MODEL_PATH)
+print(f"  Saved: {MODEL_PATH}")
 
-print("\n📊 Confusion Matrix from Snowflake:")
-session.table("CONFUSION_MATRIX").show()
-
-print("\n" + "─" * 60)
-print("🚀 SECTION 11: REGISTERING PREDICTION UDF")
-print("─" * 60)
-
-@session.udf.register(
-    name="predict_phishing",
-    is_permanent=True,
-    stage_location="@PHISHING_MODEL_STAGE",
-    packages=["scikit-learn", "joblib", "pandas"],
-    replace=True,
-    return_type="float",
-    input_types=["float"] * len(FEATURES),
-    comment="UDF to predict phishing probability for an email"
+print("\nStep 5: Connecting to Snowflake to write results...")
+conn = snowflake.connector.connect(
+    account   = ACCOUNT,
+    user      = USER,
+    password  = PASSWORD,
+    warehouse = "PHISHING_ML_WH",
+    database  = "PHISHING_DB",
+    schema    = "PHISHING_SCHEMA",
 )
-def predict_phishing(*feature_values):
-    """
-    Returns phishing probability (0.0 to 1.0) for a given email.
-    Input: feature values in same order as FEATURES list.
-    Output: probability score (>0.5 = phishing)
-    """
-    import joblib
-    import pandas as pd
-    import sys
-    import os
+cs = conn.cursor()
+print("  Connected!")
 
-    model_path = os.path.join(sys._xoptions.get("snowflake_import_directory", ""),
-                              "phishing_detector_model.pkl")
-    model = joblib.load(model_path)
+print("\nStep 6: Writing MODEL_METRICS to Snowflake...")
+cs.execute("""
+    CREATE OR REPLACE TABLE MODEL_METRICS (
+        MODEL_NAME      VARCHAR(100),
+        ACCURACY        FLOAT,
+        PRECISION_SCORE FLOAT,
+        RECALL_SCORE    FLOAT,
+        F1_SCORE        FLOAT,
+        AUC_ROC         FLOAT,
+        IS_BEST         BOOLEAN
+    )
+""")
+for r in results:
+    is_best = str(r["name"] == best["name"]).upper()
+    cs.execute(f"""
+        INSERT INTO MODEL_METRICS VALUES (
+            '{r["name"]}', {r["accuracy"]:.6f}, {r["precision"]:.6f},
+            {r["recall"]:.6f}, {r["f1"]:.6f}, {r["auc_roc"]:.6f}, {is_best}
+        )
+    """)
+print("  MODEL_METRICS saved.")
 
-    feature_names = [
-        'has_url', 'url_count', 'has_ip_url', 'url_length',
-        'has_urgent_words', 'html_tags_count', 'num_special_chars',
-        'word_count', 'subject_length', 'sender_name_mismatch',
-        'has_attachment', 'reply_to_different', 'spf_pass', 'dkim_pass',
-        'auth_both_failed', 'url_density', 'special_char_ratio',
-        'high_risk_combo', 'has_long_url', 'short_body'
-    ]
+print("\nStep 7: Writing sample predictions to Snowflake...")
+cs.execute("""
+    CREATE OR REPLACE TABLE MODEL_PREDICTIONS (
+        TRUE_LABEL INTEGER,
+        PREDICTED  INTEGER,
+        SPAM_PROB  FLOAT
+    )
+""")
+y_pred_best  = best["pipeline"].predict(X_test)
+y_proba_best = best["pipeline"].predict_proba(X_test)[:, 1]
 
-    features_df = pd.DataFrame([list(feature_values)], columns=feature_names)
-    proba = model.predict_proba(features_df)[0][1]
-    return float(proba)
+pred_df = pd.DataFrame({
+    "TRUE_LABEL": y_test.values[:2000],
+    "PREDICTED":  y_pred_best[:2000],
+    "SPAM_PROB":  y_proba_best[:2000],
+})
+for _, row in pred_df.iterrows():
+    cs.execute(f"INSERT INTO MODEL_PREDICTIONS VALUES ({int(row.TRUE_LABEL)}, {int(row.PREDICTED)}, {row.SPAM_PROB:.6f})")
+print(f"  {len(pred_df):,} predictions saved.")
 
-print("✅ UDF 'predict_phishing' registered in Snowflake!")
-
-print("\n🧪 Testing UDF with a phishing email example:")
-session.sql("""
+print("\nStep 8: Creating CONFUSION_MATRIX view...")
+cm = best["cm"]
+tn, fp, fn, tp = cm.ravel()
+cs.execute(f"""
+    CREATE OR REPLACE VIEW CONFUSION_MATRIX AS
     SELECT
-        EMAIL_ID,
-        LABEL,
-        CASE WHEN LABEL = 1 THEN 'Phishing' ELSE 'Legitimate' END AS ACTUAL,
-        ROUND(predict_phishing(
-            HAS_URL, URL_COUNT, HAS_IP_URL, URL_LENGTH,
-            HAS_URGENT_WORDS, HTML_TAGS_COUNT, NUM_SPECIAL_CHARS,
-            WORD_COUNT, SUBJECT_LENGTH, SENDER_NAME_MISMATCH,
-            HAS_ATTACHMENT, REPLY_TO_DIFFERENT, SPF_PASS, DKIM_PASS,
-            AUTH_BOTH_FAILED, URL_DENSITY, SPECIAL_CHAR_RATIO,
-            HIGH_RISK_COMBO, HAS_LONG_URL, SHORT_BODY
-        ), 4) AS PHISHING_PROBABILITY,
-        CASE
-            WHEN predict_phishing(
-                HAS_URL, URL_COUNT, HAS_IP_URL, URL_LENGTH,
-                HAS_URGENT_WORDS, HTML_TAGS_COUNT, NUM_SPECIAL_CHARS,
-                WORD_COUNT, SUBJECT_LENGTH, SENDER_NAME_MISMATCH,
-                HAS_ATTACHMENT, REPLY_TO_DIFFERENT, SPF_PASS, DKIM_PASS,
-                AUTH_BOTH_FAILED, URL_DENSITY, SPECIAL_CHAR_RATIO,
-                HIGH_RISK_COMBO, HAS_LONG_URL, SHORT_BODY
-            ) >= 0.5 THEN 'PHISHING'
-            ELSE 'LEGITIMATE'
-        END AS PREDICTION
-    FROM ENGINEERED_FEATURES
-    LIMIT 10
-""").show()
+        {tp}   AS TRUE_POSITIVES,
+        {tn}   AS TRUE_NEGATIVES,
+        {fp}   AS FALSE_POSITIVES,
+        {fn}   AS FALSE_NEGATIVES,
+        ROUND({tp/(tp+fn)*100}, 2) AS RECALL_PCT,
+        ROUND({tp/(tp+fp)*100}, 2) AS PRECISION_PCT
+""")
+print("  CONFUSION_MATRIX view created.")
 
-print("\n" + "=" * 60)
-print("🎉 PIPELINE COMPLETE - SUMMARY")
-print("=" * 60)
-print(f"\n✅ Data loaded          : {len(df)} emails")
-print(f"✅ Features engineered  : {len(FEATURES)} features")
-print(f"✅ Models trained       : {len(models)}")
-print(f"🏆 Best model          : {best_model_name}")
-print(f"   Accuracy            : {best_result['accuracy']*100:.2f}%")
-print(f"   Precision           : {best_result['precision']*100:.2f}%")
-print(f"   Recall              : {best_result['recall']*100:.2f}%")
-print(f"   F1 Score            : {best_result['f1']*100:.2f}%")
-print(f"   AUC-ROC             : {best_result['auc_roc']:.4f}")
-print(f"\n✅ Model saved to      : @PHISHING_MODEL_STAGE")
-print(f"✅ Predictions saved   : MODEL_PREDICTIONS table")
-print(f"✅ Metrics saved       : MODEL_METRICS table")
-print(f"✅ UDF deployed        : predict_phishing()")
-print(f"\n{'=' * 60}")
+cs.close()
+conn.close()
 
-session.close()
-print("\n✅ Snowflake session closed.")
+print("\n" + "="*60)
+print("  PIPELINE COMPLETE!")
+print("="*60)
+print(f"  Best Model      : {best['name']}")
+print(f"  Accuracy        : {best['accuracy']*100:.2f}%")
+print(f"  Precision       : {best['precision']*100:.2f}%")
+print(f"  Recall          : {best['recall']*100:.2f}%")
+print(f"  F1 Score        : {best['f1']*100:.2f}%")
+print(f"  AUC-ROC         : {best['auc_roc']:.4f}")
+print(f"  Training Emails : {len(X_train):,}")
+print(f"  Test Emails     : {len(X_test):,}")
+print(f"  True Positives  : {tp:,}  (spam caught)")
+print(f"  False Negatives : {fn:,}  (spam missed)")
+print("="*60)
+print("\nSnowflake tables updated:")
+print("  PHISHING_DB.PHISHING_SCHEMA.MODEL_METRICS")
+print("  PHISHING_DB.PHISHING_SCHEMA.MODEL_PREDICTIONS")
+print("  PHISHING_DB.PHISHING_SCHEMA.CONFUSION_MATRIX (view)")
+print("\nAll done!")
