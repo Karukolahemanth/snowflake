@@ -1,0 +1,9 @@
+streamlit
+snowflake-snowpark-python
+pandas
+numpy
+scikit-learn
+joblib
+matplotlib
+seaborn
+plotly
