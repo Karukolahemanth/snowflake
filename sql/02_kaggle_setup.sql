@@ -1,0 +1,24 @@
+USE WAREHOUSE PHISHING_ML_WH;
+USE DATABASE PHISHING_DB;
+USE SCHEMA PHISHING_SCHEMA;
+
+CREATE OR REPLACE TABLE KAGGLE_EMAILS (
+    EMAIL_ID  INTEGER,
+    SENDER    VARCHAR(500),
+    SUBJECT   VARCHAR(500),
+    BODY      TEXT,
+    URLS      INTEGER,
+    LABEL     INTEGER,
+    SOURCE    VARCHAR(100)
+);
+
+CREATE OR REPLACE STAGE KAGGLE_EMAIL_STAGE
+    FILE_FORMAT = (
+        TYPE                        = 'CSV'
+        FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+        SKIP_HEADER                 = 1
+        NULL_IF                     = ('NULL','null','','\\N')
+        EMPTY_FIELD_AS_NULL         = TRUE
+    );
+
+SELECT 'Kaggle table and stage created!' AS STATUS;
